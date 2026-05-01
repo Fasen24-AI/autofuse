@@ -1,0 +1,25 @@
+{
+  "autofuse_version": "4.0",
+  "exported": "2026-01-01T00:00:00",
+  "workstations": [
+    {
+      "name": "WORKSTATION-NAME",
+      "lan_ip": "192.168.1.100",
+      "vpn_ip": "172.16.0.100",
+      "disks": [
+        {
+          "letter": "C",
+          "label": "System",
+          "remote_path": "/C:/"
+        },
+        {
+          "letter": "D",
+          "label": "Data",
+          "remote_path": "/D:/",
+          "primary": true
+        }
+      ]
+    }
+  ],
+  "note": "Import with: autofuse import-config <file>"
+}

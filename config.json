@@ -1,0 +1,46 @@
+{
+  "workstations": [
+    {
+      "name": "ml-workstation",
+      "user": "YourWindowsUser",
+      "lan_ip": "192.168.1.100",
+      "vpn_ip": "172.16.0.100",
+      "ssh_key": "~/.ssh/id_ed25519",
+      "disks": [
+        {
+          "letter": "C",
+          "label": "System",
+          "remote_path": "/C:/"
+        },
+        {
+          "letter": "D",
+          "label": "AIProjects",
+          "remote_path": "/D:/",
+          "primary": true
+        }
+      ]
+    }
+  ],
+  "mount_base": "~/workstation",
+  "ssh_options": {
+    "cipher": "aes128-gcm@openssh.com",
+    "compression": false,
+    "keepalive_interval": 30,
+    "keepalive_count": 3,
+    "connect_timeout": 10
+  },
+  "cache_options": {
+    "cache_timeout": 115200,
+    "attr_timeout": 115200,
+    "entry_timeout": 115200,
+    "kernel_cache": true,
+    "auto_cache": true
+  },
+  "io_options": {
+    "iosize": 1048576,
+    "max_write": 65536,
+    "noappledouble": true,
+    "noapplexattr": true,
+    "defer_permissions": true
+  }
+}
