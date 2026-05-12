@@ -1,0 +1,789 @@
+#!/bin/bash
+# AutoFuse CLI v4.1
+# User-friendly CLI wrapper for mount.sh and discover.sh
+
+set -euo pipefail
+
+VERSION="4.1"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Disable colors if not a terminal
+if [ ! -t 1 ]; then
+    GREEN='' RED='' YELLOW='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+# ─── Find mount.sh and discover.sh ───────────────────────────────────────────
+
+_find_scripts() {
+    local dir
+
+    # 1. Homebrew libexec (set by formula inreplace)
+    dir="SCRIPT_DIR_PLACEHOLDER"
+    if [ "$dir" != "SCRIPT_DIR_PLACEHOLDER" ] && [ -f "$dir/mount.sh" ]; then
+        echo "$dir"
+        return
+    fi
+
+    # 2. Same directory as this script (development / local install)
+    dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$dir/mount.sh" ]; then
+        echo "$dir"
+        return
+    fi
+
+    # 3. Parent directory (cli/ subdirectory layout)
+    if [ -f "$dir/../mount.sh" ]; then
+        echo "$(cd "$dir/.." && pwd)"
+        return
+    fi
+
+    # 4. macOS app bundle Resources
+    if [ -f "$dir/../Resources/mount.sh" ]; then
+        echo "$(cd "$dir/../Resources" && pwd)"
+        return
+    fi
+
+    # 5. Homebrew Cellar common paths
+    for candidate in /opt/homebrew/opt/autofuse/libexec /usr/local/opt/autofuse/libexec; do
+        if [ -f "$candidate/mount.sh" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+
+    echo ""
+}
+
+SCRIPT_DIR="$(_find_scripts)"
+if [ -z "$SCRIPT_DIR" ]; then
+    printf "${RED}Error:${NC} Cannot find mount.sh. Make sure AutoFuse is properly installed.\n" >&2
+    exit 1
+fi
+
+MOUNT_SH="$SCRIPT_DIR/mount.sh"
+DISCOVER_SH="$SCRIPT_DIR/discover.sh"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+_header() {
+    printf "${BOLD}${CYAN}AutoFuse${NC} ${DIM}v${VERSION}${NC}\n"
+    printf "${DIM}─────────────────────────────────────────${NC}\n"
+}
+
+_status_icon() {
+    case "$1" in
+        mounted*)  printf "${GREEN}●${NC}" ;;
+        stale*)    printf "${YELLOW}●${NC}" ;;
+        unmounted*)printf "${RED}○${NC}" ;;
+        *)         printf "${DIM}?${NC}" ;;
+    esac
+}
+
+_status_label() {
+    case "$1" in
+        mounted*)  printf "${GREEN}mounted${NC}" ;;
+        stale*)    printf "${YELLOW}stale${NC}" ;;
+        unmounted*)printf "${RED}unmounted${NC}" ;;
+        *)         printf "${DIM}unknown${NC}" ;;
+    esac
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    _header
+    printf "\n"
+
+    local has_output=0
+    # Print table header
+    printf "  ${BOLD}%-4s %-12s %-6s %-12s %-30s${NC}\n" "" "WORKSTATION" "DISK" "STATUS" "MOUNT POINT"
+    printf "  ${DIM}%-4s %-12s %-6s %-12s %-30s${NC}\n" "──" "───────────" "────" "──────" "───────────"
+
+    while IFS='|' read -r name disk result; do
+        [ -z "$name" ] && continue
+        has_output=1
+        local status="${result%%:*}"
+        local path="${result#*:}"
+
+        local icon
+        icon="$(_status_icon "$status")"
+        local label
+        label="$(_status_label "$status")"
+
+        printf "  %b  %-12s %-6s %b    %s\n" "$icon" "$name" "$disk" "$label" "$path"
+    done < <(bash "$MOUNT_SH" status-all 2>/dev/null)
+
+    if [ "$has_output" -eq 0 ]; then
+        printf "  ${DIM}No workstations configured.${NC}\n"
+    fi
+    printf "\n"
+}
+
+cmd_mount() {
+    local ws="${1:-}" disk="${2:-}"
+
+    if [ -z "$ws" ]; then
+        # Mount all
+        printf "${CYAN}Mounting all disks...${NC}\n"
+        while IFS= read -r line; do
+            _format_mount_result "$line"
+        done < <(bash "$MOUNT_SH" mount-all 2>/dev/null)
+    elif [ -z "$disk" ]; then
+        # Mount all disks for a workstation
+        printf "${CYAN}Mounting all disks for ${BOLD}${ws}${NC}${CYAN}...${NC}\n"
+        while IFS= read -r line; do
+            _format_mount_result "$line"
+        done < <(bash "$MOUNT_SH" mount "$ws" 2>/dev/null)
+    else
+        # Mount specific disk
+        printf "${CYAN}Mounting ${BOLD}${ws}:${disk}${NC}${CYAN}...${NC}\n"
+        while IFS= read -r line; do
+            _format_mount_result "$line"
+        done < <(bash "$MOUNT_SH" mount "$ws" "$disk" 2>/dev/null)
+    fi
+}
+
+_format_mount_result() {
+    local line="$1"
+    case "$line" in
+        mounted_lan:*)
+            printf "  ${GREEN}✓${NC} Mounted via LAN: %s\n" "${line#mounted_lan:}" ;;
+        mounted_vpn:*)
+            printf "  ${GREEN}✓${NC} Mounted via VPN: %s\n" "${line#mounted_vpn:}" ;;
+        mounted_wol_lan:*)
+            printf "  ${GREEN}✓${NC} Mounted via WoL+LAN: %s\n" "${line#mounted_wol_lan:}" ;;
+        mounted_wol_vpn:*)
+            printf "  ${GREEN}✓${NC} Mounted via WoL+VPN: %s\n" "${line#mounted_wol_vpn:}" ;;
+        trying_wol:*)
+            printf "  ${YELLOW}⏳${NC} Sending Wake-on-LAN...\n" ;;
+        wol_sending:*)
+            printf "  ${YELLOW}⏳${NC} Waking %s...\n" "${line#wol_sending:}" ;;
+        wol_waiting:*)
+            printf "  ${DIM}   Waiting... %s${NC}\n" "${line#*:}" ;;
+        wol_online:*)
+            printf "  ${GREEN}✓${NC} Host online: %s\n" "${line#wol_online:}" ;;
+        wol_timeout:*)
+            printf "  ${RED}✗${NC} WoL timeout: %s\n" "${line#wol_timeout:}" ;;
+        failed:*)
+            local rest="${line#failed:}"
+            local path="${rest%%:*}"
+            local err="${rest#*:}"
+            printf "  ${RED}✗${NC} Failed: %s\n" "$path"
+            [ -n "$err" ] && printf "    ${DIM}%s${NC}\n" "$err" ;;
+        error:*)
+            printf "  ${RED}✗${NC} Error: %s\n" "${line#error:}" ;;
+        *)
+            [ -n "$line" ] && printf "  %s\n" "$line" ;;
+    esac
+}
+
+cmd_unmount() {
+    local ws="${1:-}" disk="${2:-}"
+
+    if [ -z "$ws" ]; then
+        printf "${CYAN}Unmounting all disks...${NC}\n"
+        while IFS= read -r line; do
+            case "$line" in
+                unmounted:*)
+                    printf "  ${GREEN}✓${NC} Unmounted: %s\n" "${line#unmounted:}" ;;
+                *)
+                    [ -n "$line" ] && printf "  %s\n" "$line" ;;
+            esac
+        done < <(bash "$MOUNT_SH" unmount-all 2>/dev/null)
+    elif [ -z "$disk" ]; then
+        printf "${CYAN}Unmounting all disks for ${BOLD}${ws}${NC}${CYAN}...${NC}\n"
+        while IFS= read -r line; do
+            case "$line" in
+                unmounted:*)
+                    printf "  ${GREEN}✓${NC} Unmounted: %s\n" "${line#unmounted:}" ;;
+                *)
+                    [ -n "$line" ] && printf "  %s\n" "$line" ;;
+            esac
+        done < <(bash "$MOUNT_SH" unmount "$ws" 2>/dev/null)
+    else
+        printf "${CYAN}Unmounting ${BOLD}${ws}:${disk}${NC}${CYAN}...${NC}\n"
+        while IFS= read -r line; do
+            case "$line" in
+                unmounted:*)
+                    printf "  ${GREEN}✓${NC} Unmounted: %s\n" "${line#unmounted:}" ;;
+                *)
+                    [ -n "$line" ] && printf "  %s\n" "$line" ;;
+            esac
+        done < <(bash "$MOUNT_SH" unmount "$ws" "$disk" 2>/dev/null)
+    fi
+}
+
+cmd_wake() {
+    local ws="${1:-}"
+    if [ -z "$ws" ]; then
+        printf "${RED}Usage:${NC} autofuse wake <workstation>\n"
+        exit 1
+    fi
+    printf "${CYAN}Sending Wake-on-LAN to ${BOLD}${ws}${NC}${CYAN}...${NC}\n"
+    local result
+    result="$(bash "$MOUNT_SH" wol "$ws" 2>/dev/null)"
+    case "$result" in
+        wol_sent)
+            printf "  ${GREEN}✓${NC} Magic packet sent to %s\n" "$ws" ;;
+        no_mac*)
+            printf "  ${RED}✗${NC} No MAC address configured for %s\n" "$ws" ;;
+        invalid_mac*)
+            printf "  ${RED}✗${NC} Invalid MAC address for %s\n" "$ws" ;;
+        *)
+            [ -n "$result" ] && printf "  %s\n" "$result" ;;
+    esac
+}
+
+cmd_heal() {
+    _header
+    printf "\n${CYAN}Healing stale mounts...${NC}\n\n"
+
+    while IFS='|' read -r name lip vip disks mac; do
+        [ -z "$name" ] && continue
+        IFS=',' read -ra disk_arr <<< "$disks"
+        for dl in "${disk_arr[@]}"; do
+            local result
+            result="$(bash "$MOUNT_SH" heal "$name" "$dl" 2>/dev/null)"
+            local status="${result%%:*}"
+            case "$status" in
+                healing_stale)
+                    printf "  ${YELLOW}⟳${NC}  Healing ${BOLD}%s:%s${NC}...\n" "$name" "$dl" ;;
+                healthy)
+                    printf "  ${GREEN}✓${NC}  %s:%s is healthy\n" "$name" "$dl" ;;
+                not_mounted)
+                    printf "  ${DIM}○${NC}  %s:%s not mounted\n" "$name" "$dl" ;;
+                mounted*)
+                    printf "  ${GREEN}✓${NC}  %s:%s re-mounted: %s\n" "$name" "$dl" "${result#*:}" ;;
+                failed*)
+                    printf "  ${RED}✗${NC}  %s:%s heal failed\n" "$name" "$dl" ;;
+                *)
+                    printf "  %s:%s %s\n" "$name" "$dl" "$result" ;;
+            esac
+        done
+    done < <(bash "$MOUNT_SH" list 2>/dev/null)
+
+    printf "\n"
+}
+
+cmd_discover() {
+    _header
+    printf "\n${CYAN}Scanning local network for SSH hosts...${NC}\n\n"
+
+    local hosts=()
+    local i=0
+
+    while IFS='|' read -r ip hostname mac ssh_ok; do
+        [ -z "$ip" ] && continue
+        i=$((i + 1))
+        hosts+=("$ip|$hostname|$mac|$ssh_ok")
+
+        local ssh_label
+        if [ "$ssh_ok" = "yes" ]; then
+            ssh_label="${GREEN}SSH${NC}"
+        else
+            ssh_label="${DIM}no SSH${NC}"
+        fi
+
+        local display_name="${hostname:-$ip}"
+        printf "  ${BOLD}%2d${NC}  %-20s %-16s %-18s %b\n" \
+            "$i" "$display_name" "$ip" "$mac" "$ssh_label"
+    done < <(bash "$DISCOVER_SH" scan-network 2>/dev/null)
+
+    if [ "$i" -eq 0 ]; then
+        printf "  ${DIM}No hosts found on the network.${NC}\n"
+        return
+    fi
+
+    printf "\n"
+    printf "${CYAN}Enter number to probe (or press Enter to cancel):${NC} "
+    read -r choice
+
+    if [ -z "$choice" ]; then
+        return
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then
+        printf "${RED}Invalid selection.${NC}\n"
+        return
+    fi
+
+    local selected="${hosts[$((choice - 1))]}"
+    local sel_ip="${selected%%|*}"
+
+    printf "\n"
+    cmd_probe "$sel_ip"
+}
+
+cmd_probe() {
+    local host="${1:-}"
+    if [ -z "$host" ]; then
+        printf "${RED}Usage:${NC} autofuse probe <host>\n"
+        exit 1
+    fi
+
+    printf "${CYAN}Probing ${BOLD}${host}${NC}${CYAN}...${NC}\n\n"
+
+    local os="" hostname="" mac=""
+    local disks=()
+
+    while IFS=$'\t' read -r key val; do
+        case "$key" in
+            os)       os="$val" ;;
+            hostname) hostname="$val" ;;
+            mac)      mac="$val" ;;
+            disk)     disks+=("$val") ;;
+            error:*)
+                printf "  ${RED}✗${NC} %s\n" "$key: $val"
+                return 1 ;;
+        esac
+    done < <(bash "$DISCOVER_SH" probe-host "$host" 2>/dev/null)
+
+    if [ -z "$os" ]; then
+        printf "  ${RED}✗${NC} Could not probe host (SSH failed or host unreachable)\n"
+        return 1
+    fi
+
+    printf "  ${BOLD}Hostname:${NC}  %s\n" "${hostname:-unknown}"
+    printf "  ${BOLD}OS:${NC}        %s\n" "$os"
+    printf "  ${BOLD}MAC:${NC}       %s\n" "${mac:-unknown}"
+
+    if [ "${#disks[@]}" -gt 0 ]; then
+        printf "  ${BOLD}Disks:${NC}\n"
+        for d in "${disks[@]}"; do
+            local path="${d%%|*}"
+            local rest="${d#*|}"
+            local label="${rest%%|*}"
+            rest="${rest#*|}"
+            local used="${rest%%|*}"
+            local total="${rest#*|}"
+            printf "    %-20s  %s / %s\n" "$path" "${used:-?}" "${total:-?}"
+        done
+    fi
+}
+
+cmd_add() {
+    _header
+    printf "\n${BOLD}Add a new workstation${NC}\n\n"
+
+    # Name
+    printf "${CYAN}Workstation name:${NC} "
+    read -r ws_name
+    if [ -z "$ws_name" ]; then
+        printf "${RED}Name is required.${NC}\n"
+        return 1
+    fi
+
+    # User
+    printf "${CYAN}SSH username:${NC} "
+    read -r ws_user
+    if [ -z "$ws_user" ]; then
+        printf "${RED}Username is required.${NC}\n"
+        return 1
+    fi
+
+    # IP — manual or discover
+    printf "${CYAN}IP address (or 'd' to discover):${NC} "
+    read -r ws_ip
+    if [ "$ws_ip" = "d" ] || [ "$ws_ip" = "D" ]; then
+        printf "\n${CYAN}Scanning network...${NC}\n"
+        local hosts=()
+        local i=0
+        while IFS='|' read -r ip hostname mac ssh_ok; do
+            [ -z "$ip" ] && continue
+            [ "$ssh_ok" != "yes" ] && continue
+            i=$((i + 1))
+            hosts+=("$ip")
+            printf "  ${BOLD}%2d${NC}  %-16s  %s\n" "$i" "$ip" "${hostname:-}"
+        done < <(bash "$DISCOVER_SH" scan-network 2>/dev/null)
+
+        if [ "$i" -eq 0 ]; then
+            printf "  ${DIM}No SSH hosts found.${NC}\n"
+            printf "${CYAN}IP address:${NC} "
+            read -r ws_ip
+        else
+            printf "\n${CYAN}Select host number:${NC} "
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ]; then
+                ws_ip="${hosts[$((choice - 1))]}"
+            else
+                printf "${RED}Invalid selection.${NC}\n"
+                return 1
+            fi
+        fi
+    fi
+
+    if [ -z "$ws_ip" ]; then
+        printf "${RED}IP address is required.${NC}\n"
+        return 1
+    fi
+
+    # Probe for MAC and disks
+    printf "\n${CYAN}Probing ${ws_ip} for details...${NC}\n"
+    local probe_mac="" probe_os=""
+    local probe_disks=()
+
+    while IFS=$'\t' read -r key val; do
+        case "$key" in
+            os)   probe_os="$val" ;;
+            mac)  probe_mac="$val" ;;
+            disk) probe_disks+=("$val") ;;
+        esac
+    done < <(bash "$DISCOVER_SH" probe-host "$ws_ip" "$ws_user" 2>/dev/null)
+
+    if [ -n "$probe_os" ]; then
+        printf "  OS: %s\n" "$probe_os"
+    fi
+    if [ -n "$probe_mac" ]; then
+        printf "  MAC: %s\n" "$probe_mac"
+    fi
+
+    # MAC address — use probed or ask
+    local final_mac="$probe_mac"
+    if [ -z "$final_mac" ]; then
+        printf "${CYAN}MAC address (for Wake-on-LAN, optional):${NC} "
+        read -r final_mac
+    else
+        printf "${CYAN}MAC address [${final_mac}]:${NC} "
+        read -r user_mac
+        [ -n "$user_mac" ] && final_mac="$user_mac"
+    fi
+
+    # Disks
+    printf "\n${BOLD}Configure disks:${NC}\n"
+    if [ "${#probe_disks[@]}" -gt 0 ]; then
+        printf "  ${DIM}Detected disks:${NC}\n"
+        local di=0
+        for d in "${probe_disks[@]}"; do
+            di=$((di + 1))
+            local path="${d%%|*}"
+            printf "    %d. %s\n" "$di" "$path"
+        done
+        printf "\n"
+    fi
+
+    local disk_entries=""
+    local first_disk=1
+    while true; do
+        printf "${CYAN}Disk letter (e.g. C, D) or Enter to finish:${NC} "
+        read -r disk_letter
+        [ -z "$disk_letter" ] && break
+
+        printf "${CYAN}Remote path (e.g. /C:/):${NC} "
+        read -r disk_path
+
+        printf "${CYAN}Label (e.g. System):${NC} "
+        read -r disk_label
+
+        local primary_flag=""
+        if [ "$first_disk" -eq 1 ]; then
+            printf "${CYAN}Primary disk? (y/N):${NC} "
+            read -r is_primary
+            if [ "$is_primary" = "y" ] || [ "$is_primary" = "Y" ]; then
+                primary_flag=', "primary": true'
+            fi
+            first_disk=0
+        fi
+
+        local entry="{ \"letter\": \"${disk_letter}\", \"label\": \"${disk_label}\", \"remote_path\": \"${disk_path}\"${primary_flag} }"
+        if [ -z "$disk_entries" ]; then
+            disk_entries="$entry"
+        else
+            disk_entries="${disk_entries}, ${entry}"
+        fi
+    done
+
+    if [ -z "$disk_entries" ]; then
+        printf "${RED}At least one disk is required.${NC}\n"
+        return 1
+    fi
+
+    # Find config path
+    local config_path
+    config_path="$SCRIPT_DIR/config.json"
+    if [ ! -f "$config_path" ]; then
+        config_path="$HOME/.config/autofuse/config.json"
+    fi
+
+    if [ ! -f "$config_path" ]; then
+        printf "${RED}Cannot find config.json${NC}\n"
+        return 1
+    fi
+
+    printf "\n${CYAN}Adding workstation to config...${NC}\n"
+
+    python3 -c "
+import json, sys
+
+config_path = sys.argv[1]
+name = sys.argv[2]
+user = sys.argv[3]
+ip = sys.argv[4]
+mac = sys.argv[5]
+disks_json = sys.argv[6]
+
+with open(config_path) as f:
+    cfg = json.load(f)
+
+# Check for duplicate
+for w in cfg.get('workstations', []):
+    if w['name'] == name:
+        print('error:duplicate_name')
+        sys.exit(1)
+
+new_ws = {
+    'name': name,
+    'user': user,
+    'lan_ip': ip,
+    'vpn_ip': '',
+    'ssh_key': '~/.ssh/id_ed25519',
+    'disks': json.loads('[' + disks_json + ']')
+}
+if mac:
+    new_ws['mac_address'] = mac
+
+cfg.setdefault('workstations', []).append(new_ws)
+
+with open(config_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+
+print('ok')
+" "$config_path" "$ws_name" "$ws_user" "$ws_ip" "${final_mac:-}" "$disk_entries"
+
+    local add_result=$?
+    if [ $add_result -eq 0 ]; then
+        printf "  ${GREEN}✓${NC} Added workstation ${BOLD}%s${NC} (%s)\n" "$ws_name" "$ws_ip"
+    else
+        printf "  ${RED}✗${NC} Failed to add workstation\n"
+    fi
+}
+
+cmd_config() {
+    local config_path="$SCRIPT_DIR/config.json"
+    if [ ! -f "$config_path" ]; then
+        config_path="$HOME/.config/autofuse/config.json"
+    fi
+
+    if [ ! -f "$config_path" ]; then
+        printf "${RED}Cannot find config.json${NC}\n"
+        exit 1
+    fi
+
+    local editor="${EDITOR:-nano}"
+    printf "${CYAN}Opening %s in %s...${NC}\n" "$config_path" "$editor"
+    "$editor" "$config_path"
+}
+
+cmd_log() {
+    local log_file="$HOME/.config/autofuse/autofuse.log"
+    if [ ! -f "$log_file" ]; then
+        printf "${DIM}No log file found.${NC}\n"
+        return
+    fi
+
+    _header
+    printf "\n${BOLD}Recent log entries:${NC}\n\n"
+    tail -30 "$log_file" | while IFS= read -r line; do
+        printf "  ${DIM}%s${NC}\n" "$line"
+    done
+    printf "\n${DIM}Log file: %s${NC}\n" "$log_file"
+}
+
+cmd_connect() {
+    local ws="${1:-}"
+    if [ -z "$ws" ]; then
+        printf "${RED}Usage:${NC} autofuse connect <workstation>\n" >&2
+        exit 1
+    fi
+    local state
+    state="$(bash "$MOUNT_SH" ping-check "$ws" 2>/dev/null || true)"
+    # ping-check prints "name|result"; match the result field exactly so a
+    # workstation whose name contains "offline" can't false-positive.
+    case "$state" in
+        *'|offline')
+            printf "${YELLOW}Host offline — sending Wake-on-LAN and waiting...${NC}\n"
+            while IFS= read -r line; do
+                _format_mount_result "$line"
+            done < <(bash "$MOUNT_SH" wol-wait "$ws" 60 2>/dev/null || true)
+            ;;
+    esac
+
+    # Snapshot the disk list BEFORE mounting: mount.sh spawns ssh/sshfs,
+    # which read stdin and would eat the remaining lines of a piped loop.
+    # Capturing also keeps errexit+pipefail from silently killing us if
+    # the engine fails (e.g. unknown workstation).
+    local disk_list
+    disk_list="$(bash "$MOUNT_SH" disks "$ws" 2>/dev/null || true)"
+    if [ -z "$disk_list" ]; then
+        printf "  ${RED}✗${NC} No disks configured for %s (unknown workstation?)\n" "$ws" >&2
+        exit 1
+    fi
+
+    while IFS='|' read -r letter label rpath; do
+        [ -z "$letter" ] && continue
+        printf "${CYAN}Mounting ${BOLD}${ws}:${letter}${NC}${CYAN}...${NC}\n"
+        while IFS= read -r line; do
+            _format_mount_result "$line"
+        done < <(bash "$MOUNT_SH" mount "$ws" "$letter" </dev/null 2>/dev/null || true)
+    done <<< "$disk_list"
+}
+
+# Machine-readable output for agents and scripts. Engine line formats are a
+# stable API — this only re-shapes them as JSON.
+cmd_json() {
+    local what="${1:-status}"
+    case "$what" in
+        status)
+            bash "$MOUNT_SH" status-all | python3 -c '
+import json, sys
+rows = []
+for line in sys.stdin:
+    parts = line.strip().split("|", 2)
+    if len(parts) != 3:
+        continue  # skip blank lines and anything that is not name|disk|result
+    ws, disk, result = parts
+    status, _, path = result.partition(":")
+    rows.append({"workstation": ws, "disk": disk, "status": status, "mount_point": path})
+print(json.dumps(rows, indent=2))'
+            ;;
+        health)
+            bash "$MOUNT_SH" health-json
+            ;;
+        list)
+            bash "$MOUNT_SH" list | python3 -c '
+import json, sys
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    f = (line.split("|") + [""] * 5)[:5]
+    rows.append({"name": f[0], "lan_ip": f[1], "vpn_ip": f[2],
+                 "disks": [d for d in f[3].split(",") if d], "mac": f[4]})
+print(json.dumps(rows, indent=2))'
+            ;;
+        disks)
+            local ws="${2:-}"
+            if [ -z "$ws" ]; then
+                echo '{"error": "missing_workstation_name"}' >&2
+                exit 1
+            fi
+            bash "$MOUNT_SH" disks "$ws" | python3 -c '
+import json, sys
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    f = (line.split("|") + [""] * 3)[:3]
+    rows.append({"letter": f[0], "label": f[1], "remote_path": f[2]})
+print(json.dumps(rows, indent=2))'
+            ;;
+        *)
+            printf "${RED}Usage:${NC} autofuse json [status|health|list|disks <ws>]\n" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_version() {
+    printf "AutoFuse CLI v%s\n" "$VERSION"
+}
+
+cmd_help() {
+    _header
+    printf "\n${BOLD}Usage:${NC} autofuse [command] [options]\n\n"
+    printf "${BOLD}Commands:${NC}\n"
+    printf "  ${CYAN}%-24s${NC} %s\n" ""               "Show status of all mounts (default)"
+    printf "  ${CYAN}%-24s${NC} %s\n" "mount [ws] [disk]"  "Mount disks (all if no args, specific if given)"
+    printf "  ${CYAN}%-24s${NC} %s\n" "unmount [ws] [disk]" "Unmount disks"
+    printf "  ${CYAN}%-24s${NC} %s\n" "status"             "Detailed status with colors"
+    printf "  ${CYAN}%-24s${NC} %s\n" "wake <ws>"           "Send Wake-on-LAN to workstation"
+    printf "  ${CYAN}%-24s${NC} %s\n" "heal"               "Heal all stale mounts"
+    printf "  ${CYAN}%-24s${NC} %s\n" "discover"            "Scan network interactively"
+    printf "  ${CYAN}%-24s${NC} %s\n" "probe <host>"        "Probe a host for OS, MAC, disks"
+    printf "  ${CYAN}%-24s${NC} %s\n" "add"                "Interactive wizard to add a workstation"
+    printf "  ${CYAN}%-24s${NC} %s\n" "config"             "Open config in \$EDITOR"
+    printf "  ${CYAN}%-24s${NC} %s\n" "log"                "Show recent log entries"
+    printf "  ${CYAN}%-24s${NC} %s\n" "connect <ws>"        "Ping, wake if asleep, mount all its disks"
+    printf "  ${CYAN}%-24s${NC} %s\n" "json [what]"         "Machine-readable: status|health|list|disks <ws>"
+    printf "  ${CYAN}%-24s${NC} %s\n" "raw <cmd> [...]"     "Direct engine access (run 'autofuse raw' to list)"
+    printf "  ${CYAN}%-24s${NC} %s\n" "version"            "Show version"
+    printf "  ${CYAN}%-24s${NC} %s\n" "help"               "Show this help"
+    printf "\n${BOLD}Examples:${NC}\n"
+    printf "  ${DIM}autofuse${NC}                    Show status of all mounts\n"
+    printf "  ${DIM}autofuse mount${NC}              Mount all configured disks\n"
+    printf "  ${DIM}autofuse mount ml-workstation D${NC}      Mount disk D on ml-workstation\n"
+    printf "  ${DIM}autofuse wake ml-workstation${NC}         Wake ml-workstation via WoL\n"
+    printf "  ${DIM}autofuse discover${NC}           Scan and pick from network hosts\n"
+    printf "  ${DIM}autofuse connect ml-workstation${NC}      Wake if asleep, then mount all ml-workstation disks\n"
+    printf "  ${DIM}autofuse json status${NC}        Machine-readable status for agents/scripts\n"
+    printf "\n"
+}
+
+# ─── Command dispatch ────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    ""|status)
+        cmd_status
+        ;;
+    connect)
+        cmd_connect "${2:-}"
+        ;;
+    json)
+        shift
+        cmd_json "$@"
+        ;;
+    raw)
+        # Direct engine access: every mount.sh subcommand, including ones
+        # without a friendly wrapper (host keys, endpoint cache, panic, ...).
+        shift
+        exec bash "$MOUNT_SH" "$@"
+        ;;
+    mount)
+        cmd_mount "${2:-}" "${3:-}"
+        ;;
+    unmount)
+        cmd_unmount "${2:-}" "${3:-}"
+        ;;
+    wake)
+        cmd_wake "${2:-}"
+        ;;
+    heal)
+        cmd_heal
+        ;;
+    discover)
+        cmd_discover
+        ;;
+    probe)
+        cmd_probe "${2:-}"
+        ;;
+    add)
+        cmd_add
+        ;;
+    config)
+        cmd_config
+        ;;
+    log)
+        cmd_log
+        ;;
+    version|--version|-v)
+        cmd_version
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        printf "${RED}Unknown command:${NC} %s\n\n" "$1"
+        cmd_help
+        exit 1
+        ;;
+esac
