@@ -1,0 +1,40 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Compile AutoFuse
+        run: |
+          clang -fobjc-arc \
+            -framework Cocoa \
+            -framework UserNotifications \
+            -framework ServiceManagement \
+            -framework SystemConfiguration \
+            -o AutoFuse main.m
+      
+      - name: Verify binary
+        run: |
+          ls -lh AutoFuse
+          file AutoFuse
+      
+      - name: Run tests
+        run: bash test.sh
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: AutoFuse-binary
+          path: AutoFuse
+          retention-days: 30

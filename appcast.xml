@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>AutoFuse Updates</title>
+        <link>https://github.com/Fasen24-AI/autofuse</link>
+        <description>Automatic updates for AutoFuse macOS application</description>
+        <language>en-us</language>
+
+        <!--
+          No published releases yet — channel intentionally empty so Sparkle
+          reports "you're up to date" instead of failing on a zero-length /
+          unsigned enclosure. See RELEASING.md for how to cut a release.
+
+          Each real release is an <item> like the template below. The
+          `length` MUST be the real byte size and `sparkle:edSignature` MUST be
+          the EdDSA signature produced by Sparkle's `sign_update` against the
+          uploaded .zip (the matching SUPublicEDKey must be in Info.plist):
+
+          <item>
+            <title>Version 4.1</title>
+            <description><![CDATA[ release notes html ]]></description>
+            <pubDate>Wed, 04 Jun 2026 00:00:00 +0000</pubDate>
+            <sparkle:version>4.1</sparkle:version>
+            <sparkle:shortVersionString>4.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:releaseNotesLink>https://github.com/Fasen24-AI/autofuse/releases/tag/v4.1</sparkle:releaseNotesLink>
+            <enclosure url="https://github.com/Fasen24-AI/autofuse/releases/download/v4.1/AutoFuse-4.1.zip"
+                       sparkle:version="4.1"
+                       sparkle:shortVersionString="4.1"
+                       sparkle:edSignature="REPLACE_WITH_REAL_EDDSA_SIGNATURE"
+                       type="application/octet-stream"
+                       length="REPLACE_WITH_REAL_BYTE_SIZE"/>
+          </item>
+        -->
+    </channel>
+</rss>

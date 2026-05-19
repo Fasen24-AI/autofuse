@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Compile AutoFuse
+        run: |
+          clang -fobjc-arc \
+            -framework Cocoa \
+            -framework UserNotifications \
+            -framework ServiceManagement \
+            -framework SystemConfiguration \
+            -o AutoFuse main.m
+      
+      - name: Run tests
+        run: bash test.sh
+      
+      - name: Build app bundle
+        run: bash build.sh
+      
+      - name: Get release notes
+        id: release_notes
+        run: |
+          TAG=${{ github.ref }}
+          TAG=${TAG#refs/tags/}
+          VER=${TAG#v}
+          # Extract this version's section from CHANGELOG.md (portable: no GNU head).
+          # Prints lines after "## [VER]" up to (not including) the next "## [".
+          awk -v ver="$VER" '
+            index($0, "## [" ver "]") == 1 { flag=1; next }
+            flag && index($0, "## [") == 1 { exit }
+            flag { print }
+          ' CHANGELOG.md > release_notes.txt
+          if [ ! -s release_notes.txt ]; then
+            echo "Release $TAG" > release_notes.txt
+          fi
+          cat release_notes.txt
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            AutoFuse-*.zip
+            AutoFuse
+          body_path: release_notes.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
