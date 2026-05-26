@@ -1,0 +1,37 @@
+{
+  "name": "@autofuse/mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol server for AutoFuse - remote SSHFS mounting with WoL and auto-recovery",
+  "main": "dist/index.js",
+  "bin": {
+    "autofuse-mcp": "dist/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "autofuse",
+    "sshfs",
+    "remote-mounts",
+    "wake-on-lan"
+  ],
+  "author": "Fasen24-AI",
+  "license": "PolyForm-Shield-1.0.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3",
+    "tsx": "^4.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
