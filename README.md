@@ -82,12 +82,18 @@ Don't have Homebrew? Install it first: https://brew.sh
 
 ### Step 2: Install AutoFuse
 
-**Option A — Download the App:**
+**Option A — Homebrew cask (recommended):**
+```bash
+brew install --cask Fasen24-AI/tap/autofuse
+```
+On Homebrew 6+, trust the tap first: `brew tap Fasen24-AI/tap && brew trust fasen24-ai/tap`.
+
+**Option B — Download the App:**
 1. Download `AutoFuse-<version>.zip` from [Releases](https://github.com/Fasen24-AI/autofuse/releases)
 2. Unzip and drag AutoFuse.app to your Applications folder
 3. Launch AutoFuse — it appears in your menu bar
 
-**Option B — CLI Only (Homebrew formula from this repo):**
+**Option C — CLI Only (Homebrew formula from this repo):**
 ```bash
 git clone https://github.com/Fasen24-AI/autofuse.git
 brew install --formula ./autofuse/autofuse.rb
