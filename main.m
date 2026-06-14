@@ -187,9 +187,14 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         long result = dispatch_semaphore_wait(sem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
         if (result != 0) {
+            // Timeout — terminate the child and let the in-flight reader blocks
+            // drain on their own. Terminating closes the child's pipe ends, so
+            // readDataToEndOfFile hits EOF and returns. Closing the handles
+            // here instead would race those blocks still running on the global
+            // queue and throw on a now-closed descriptor — an uncaught
+            // exception off the main thread, i.e. a crash.
             [t terminate];
-            [outPipe.fileHandleForReading closeFile];
-            [errPipe.fileHandleForReading closeFile];
+            dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
             return @"";
         }
         dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
@@ -264,10 +269,13 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         long result = dispatch_semaphore_wait(sem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
         if (result != 0) {
-            // Timeout — kill the task and close pipe handles
+            // Timeout — terminate the child and let the in-flight reader blocks
+            // drain on their own (terminating closes the child's pipe ends, so
+            // readDataToEndOfFile hits EOF). Closing the handles here would race
+            // those blocks still running on the global queue and throw on a
+            // now-closed descriptor — an uncaught exception off-main = crash.
             [t terminate];
-            [outPipe.fileHandleForReading closeFile];
-            [errPipe.fileHandleForReading closeFile];
+            dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
             return @"timeout";
         }
 
@@ -322,9 +330,10 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         long result = dispatch_semaphore_wait(sem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
         if (result != 0) {
+            // Drain the in-flight reads instead of closing the handles out from
+            // under them — see runScript:timeout: for the race that caused.
             [t terminate];
-            [outPipe.fileHandleForReading closeFile];
-            [errPipe.fileHandleForReading closeFile];
+            dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
             if (errorOutput) *errorOutput = @"Operation timed out";
             return @"timeout";
         }
@@ -375,9 +384,30 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
 }
 
 - (void)refreshStatus {
-    NSString *out = [self runScript:@[@"status-all"] timeout:15];
-    if ([out isEqualToString:@"timeout"]) return;
+    [self refreshStatusThen:nil];
+}
 
+// Authoritative status refresh. The `status-all` engine call can block for up
+// to 15s against an unreachable host, so it ALWAYS runs on a background queue —
+// running it on the main thread freezes the menu bar, the exact freeze AutoFuse
+// exists to prevent. The parsed result is applied and `completion` (typically a
+// buildMenu) is run on the main thread, so callers see fresh state. Safe to
+// call from any thread; it never blocks the caller.
+- (void)refreshStatusThen:(void (^)(void))completion {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *out = [self runScript:@[@"status-all"] timeout:15];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![out isEqualToString:@"timeout"]) [self applyStatusOutput:out];
+            [self updateIcon];
+            if (completion) completion();
+        });
+    });
+}
+
+// Parse `status-all` output ("host|disk|status[:mountpoint]" per line) into the
+// model. Main-thread only — it mutates WSDisk state that buildMenu/refreshStatusFast
+// also touch on the main thread, so keeping all writes on main avoids a data race.
+- (void)applyStatusOutput:(NSString *)out {
     for (NSString *line in [out componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
         if (line.length == 0) continue;
         NSArray *parts = [line componentsSeparatedByString:@"|"];
@@ -399,7 +429,6 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
             }
         }
     }
-    [self updateIcon];
 }
 
 - (double)measureWorstLatency {
@@ -1211,8 +1240,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
                 self.operationCount--;
                 if (self.operationCount < 0) self.operationCount = 0;
             }
-            [self refreshStatus];
-            [self buildMenu];
+            [self refreshStatusThen:^{ [self buildMenu]; }];
         });
     });
 }
@@ -1296,8 +1324,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
                 self.operationCount--;
                 if (self.operationCount < 0) self.operationCount = 0;
             }
-            [self refreshStatus];
-            [self buildMenu];
+            [self refreshStatusThen:^{ [self buildMenu]; }];
 
             // Show error feedback (#10)
             BOOL hasFailed = [result containsString:@"failed:"] || [result containsString:@"error:"] || [result isEqualToString:@"timeout"];
@@ -1422,7 +1449,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
 }
 
 - (void)doRefresh:(NSMenuItem *)sender {
-    [self loadHosts]; [self refreshStatus]; [self buildMenu];
+    [self loadHosts]; [self refreshStatusThen:^{ [self buildMenu]; }];
 }
 
 // ─── Start at Login ────────────────────────────────────────────────────────
@@ -2108,7 +2135,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     }
 
     if ([self saveConfig:cfg]) {
-        [win close]; [self loadHosts]; [self refreshStatus]; [self buildMenu];
+        [win close]; [self loadHosts]; [self refreshStatusThen:^{ [self buildMenu]; }];
     } else {
         NSAlert *a = [NSAlert new]; a.messageText = @"Save Failed";
         a.informativeText = [NSString stringWithFormat:@"Could not write to %@", self.configPath]; [a runModal];
@@ -2226,7 +2253,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
             NSMutableArray *ws = cfg[@"workstations"];
             for (NSUInteger i = 0; i < ws.count; i++)
                 if ([ws[i][@"name"] isEqualToString:hostName]) { [ws removeObjectAtIndex:i]; break; }
-            [self saveConfig:cfg]; [self loadHosts]; [self refreshStatus]; [self buildMenu];
+            [self saveConfig:cfg]; [self loadHosts]; [self refreshStatusThen:^{ [self buildMenu]; }];
         });
     });
 }
@@ -3524,7 +3551,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     data[@"wsDisks"] = disksRaw;
 
     // Reload hosts
-    [self loadHosts]; [self refreshStatus]; [self buildMenu];
+    [self loadHosts]; [self refreshStatusThen:^{ [self buildMenu]; }];
 
     [self wizardShowStep:4 inWindow:win];
 }
@@ -3823,8 +3850,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
 
         if (attempted > 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self refreshStatus];
-                [self buildMenu];
+                [self refreshStatusThen:^{ [self buildMenu]; }];
                 NSString *body = (recovered == attempted)
                     ? [NSString stringWithFormat:@"Recovered %ld stale mount%@",
                         (long)recovered, recovered == 1 ? @"" : @"s"]
@@ -3852,13 +3878,8 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     // NSMenu has no `isVisible` property (that's NSWindow), and buildMenu
     // is cheap (~20ms) so always-rebuild is fine even if the user has
     // already closed the menu.
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [self refreshStatus];
-        [self refreshVPNStatus];   // event-driven VPN refresh (replaces per-poll)
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self buildMenu];
-        });
-    });
+    [self refreshVPNStatus];   // event-driven VPN refresh (replaces per-poll)
+    [self refreshStatusThen:^{ [self buildMenu]; }];
 }
 
 // ─── UNUserNotificationCenterDelegate ──────────────────────────────────────
@@ -3927,7 +3948,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
                 // NETWORK IS GONE — emergency panic unmount to prevent Finder hang
                 [self runScript:@[@"panic-unmount-all"] timeout:15];
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self refreshStatus]; [self buildMenu];
+                    [self refreshStatusThen:^{ [self buildMenu]; }];
                     [self postNotificationWithTitle:@"Network Lost"
                                                body:@"Disconnected remote disks to prevent system freeze. They will reconnect when network returns."];
                 });
@@ -3942,7 +3963,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         NSDictionary *netCfg = [self loadConfig];
         BOOL healOnNet = netCfg[@"heal_on_network_change"] ? [netCfg[@"heal_on_network_change"] boolValue] : YES;
         if (!healOnNet) {
-            dispatch_async(dispatch_get_main_queue(), ^{ [self refreshStatus]; [self buildMenu]; });
+            [self refreshStatusThen:^{ [self buildMenu]; }];
             return;
         }
 
@@ -3955,14 +3976,12 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         if (hasStale) {
             [self runScript:@[@"heal-all"] timeout:90];
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self refreshStatus]; [self buildMenu];
+                [self refreshStatusThen:^{ [self buildMenu]; }];
                 [self postNotificationWithTitle:@"Connections Restored"
                                            body:@"Reconnected remote disks after network change."];
             });
         } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self refreshStatus]; [self buildMenu];
-            });
+            [self refreshStatusThen:^{ [self buildMenu]; }];
         }
     });
 }
@@ -3973,16 +3992,15 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     // Recreate timers on wake with fresh config + adaptive cadence (#9).
     [self applyTimerCadence:YES];
 
-    // Immediate authoritative refresh, then right-size cadence to it.
-    [self refreshStatus];
+    // Immediate authoritative refresh, then right-size cadence to the fresh
+    // state inside the completion (the refresh is async, so cadence must wait
+    // for it rather than reading stale status synchronously).
     [self refreshVPNStatus];   // event-driven VPN refresh (replaces per-poll)
-    [self buildMenu];
-    [self applyTimerCadence:NO];
+    [self refreshStatusThen:^{ [self buildMenu]; [self applyTimerCadence:NO]; }];
 
     // Delayed heal after 3s to allow network to come up (#5)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [self refreshStatus];
-        [self buildMenu];
+        [self refreshStatusThen:^{ [self buildMenu]; }];
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             BOOL hasStale = NO;
             for (WSHost *h in self.hosts)
@@ -3991,7 +4009,7 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
             if (hasStale) {
                 [self runScript:@[@"heal-all"] timeout:90];
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self refreshStatus]; [self buildMenu];
+                    [self refreshStatusThen:^{ [self buildMenu]; }];
                     [self postNotificationWithTitle:@"Wake Recovery" body:@"Stale mounts recovered after system wake"];
                 });
             }
@@ -4074,10 +4092,12 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
 #endif
 
     [self loadHosts];
-    [self refreshStatus];
     [self refreshVPNStatus];
     [self drainEndpointEvents];
     [self buildMenu];
+    // Authoritative refresh runs async (it can block up to 15s against an
+    // unreachable host — never freeze startup); re-size cadence once it lands.
+    [self refreshStatusThen:^{ [self buildMenu]; [self applyTimerCadence:NO]; }];
 
     // First-run: show setup wizard if no workstations and no FUSE backend
     // Otherwise just check dependencies as before (#12)
@@ -4096,8 +4116,9 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     NSMutableDictionary *launchCfg = [self loadConfig];
     self.showLatency = [launchCfg[@"show_latency"] boolValue];
     // Poll + auto-heal timers via the single adaptive-cadence scheduler
-    // (energy #3/#4/#5). State is already authoritative here (refreshStatus
-    // ran above), so the initial multiplier is correct.
+    // (energy #3/#4/#5). Created immediately so polling starts right away; the
+    // async refresh above re-sizes the multiplier (applyTimerCadence:NO) once
+    // authoritative state lands, a beat later.
     [self applyTimerCadence:YES];
 
     // Watch for network changes
@@ -4152,8 +4173,10 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
         });
         long timedOut = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
         if (timedOut != 0) {
+            // Drain the in-flight read instead of closing the handle under the
+            // reader block (same race as runScript:timeout:).
             [t terminate];
-            [outPipe.fileHandleForReading closeFile];
+            dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
             return nil;
         }
         dispatch_group_wait(readGroup, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
