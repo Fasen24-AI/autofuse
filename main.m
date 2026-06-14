@@ -54,8 +54,16 @@ static const char kWizardDataKey;
 // on the copied NSString.
 @property (atomic, copy) NSString *status;      // mounted / unmounted / stale
 @property (atomic, copy) NSString *mountPoint;
+// Last measured directory-listing latency in ms; -1 = not yet measured.
+// Written on the background latency queue, read on main (buildMenu) — atomic.
+@property (atomic, assign) double latencyMs;
 @end
 @implementation WSDisk
+- (instancetype)init {
+    self = [super init];
+    if (self) { _latencyMs = -1; }
+    return self;
+}
 @end
 
 @interface WSHost : NSObject
@@ -431,14 +439,22 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
     }
 }
 
+// Measure each mounted disk's directory-listing latency, recording it per-disk
+// (d.latencyMs, shown in the menu) and returning the worst for the menu-bar
+// indicator. Non-mounted disks are reset to -1 (unmeasured). Runs on the
+// background latency queue — never call from the main thread.
 - (double)measureWorstLatency {
     double worst = 0;
     for (WSHost *h in self.hosts) {
         for (WSDisk *d in h.disks) {
-            if (![d.status isEqualToString:@"mounted"] || d.mountPoint.length == 0) continue;
+            if (![d.status isEqualToString:@"mounted"] || d.mountPoint.length == 0) {
+                d.latencyMs = -1;
+                continue;
+            }
             NSDate *start = [NSDate date];
             [[NSFileManager defaultManager] contentsOfDirectoryAtPath:d.mountPoint error:nil];
             double ms = -[start timeIntervalSinceNow] * 1000.0;
+            d.latencyMs = ms;
             if (ms > worst) worst = ms;
         }
     }
@@ -1008,7 +1024,16 @@ void networkChangeCallback(CFNotificationCenterRef center, void *observer,
             }
             NSString *title;
             if (isMounted) {
-                title = [NSString stringWithFormat:@"   ● %@: — %@ — Connected", d.letter, d.label];
+                // Show per-disk latency next to "Connected" when the latency
+                // toggle is on and a measurement has landed (>200ms reads as
+                // "slow", mirroring the menu-bar indicator's thresholds).
+                NSString *conn = @"Connected";
+                if (self.showLatency && d.latencyMs >= 0) {
+                    conn = d.latencyMs > 200
+                        ? @"Connected · slow"
+                        : [NSString stringWithFormat:@"Connected · %.0fms", d.latencyMs];
+                }
+                title = [NSString stringWithFormat:@"   ● %@: — %@ — %@", d.letter, d.label, conn];
             } else if (isStale) {
                 title = [NSString stringWithFormat:@"   ⚠ %@: — %@ — Connection Lost", d.letter, d.label];
             } else {
