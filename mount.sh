@@ -6,6 +6,55 @@
 #           health, health-json, export-config, import-config, log, log-clear
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# ─── OS portability layer ───────────────────────────────────────────────────
+# AutoFuse runs on macOS (FUSE-T/macFUSE) and Linux (libfuse + sshfs). The
+# engine is the single source of truth for both; only a handful of commands
+# differ between the platforms and are branched on AF_OS here.
+AF_OS="$(uname -s)"
+
+# ping with a real 2s deadline. macOS: -t = timeout seconds. Linux: -t = TTL,
+# so the timeout flag is -W (seconds). Echoes ping output, returns ping's exit.
+_ping_host() {
+    local ip="$1"
+    if [ "$AF_OS" = "Darwin" ]; then
+        ping -c1 -t2 "$ip" 2>/dev/null
+    else
+        ping -c1 -W2 "$ip" 2>/dev/null
+    fi
+}
+
+# Force-unmount a FUSE mount point. macOS uses diskutil; Linux uses fusermount.
+_force_unmount() {
+    local mp="$1"
+    if [ "$AF_OS" = "Darwin" ]; then
+        diskutil unmount force "$mp" 2>/dev/null
+    else
+        fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null
+    fi
+}
+
+# Same, but time-bounded (3s) so a dead mount can't hang the sweep. macOS has no
+# `timeout`, so it uses the perl-alarm trick; Linux uses coreutils `timeout`.
+_force_unmount_t() {
+    local mp="$1"
+    if [ "$AF_OS" = "Darwin" ]; then
+        perl -e 'alarm 3; exec @ARGV' diskutil unmount force "$mp" 2>/dev/null
+    else
+        timeout 3 fusermount3 -u "$mp" 2>/dev/null || timeout 3 fusermount -u "$mp" 2>/dev/null
+    fi
+}
+
+# List the mount points of every sshfs/FUSE mount, one per line. The `mount`
+# output format differs: macOS is "src on /path (type,…)", Linux is
+# "src on /path type fuse.sshfs (…)".
+_list_fuse_mounts() {
+    if [ "$AF_OS" = "Darwin" ]; then
+        mount | grep -E 'osxfuse|macfuse|fuse-t' | sed -n 's/^.* on \(.*\) (.*$/\1/p'
+    else
+        mount -t fuse.sshfs 2>/dev/null | sed -n 's/^.* on \(.*\) type .*$/\1/p'
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # User config is ALWAYS preferred (it's the source of truth).
 # Bundle config is only a fallback template for first-run before user config exists.
@@ -513,6 +562,17 @@ _mount_point() {
 # ─── FUSE backend detection ───────────────────────────────────────────────
 
 _detect_fuse_backend() {
+    # Linux: libfuse ships with the distro; the sshfs binary is the real
+    # dependency (it pulls in fuse2/fuse3). If it's on PATH, we're good.
+    if [ "$AF_OS" != "Darwin" ]; then
+        if command -v sshfs >/dev/null 2>&1; then
+            echo "linuxfuse"
+            return 0
+        fi
+        echo "none"
+        return 1
+    fi
+
     # Check for macFUSE (kernel extension)
     if [ -d "/Library/Filesystems/macfuse.fs" ] || kextstat 2>/dev/null | grep -q macfuse; then
         echo "macfuse"
@@ -653,7 +713,7 @@ _kill_mount() {
     # Try graceful first, then force
     umount "$mp" 2>/dev/null
     sleep 0.5
-    diskutil unmount force "$mp" 2>/dev/null
+    _force_unmount "$mp"
     umount -f "$mp" 2>/dev/null
     # Kill any sshfs process for this mount — use fixed-string grep to prevent injection
     local bn
@@ -683,7 +743,7 @@ _reachable() {
     # Quick ping check with 2s timeout
     local ip="$1"
     [ -z "$ip" ] && return 1
-    ping -c1 -t2 "$ip" >/dev/null 2>&1
+    _ping_host "$ip" >/dev/null 2>&1
 }
 
 # Measure round-trip time in milliseconds for a single ping. Echoes the
@@ -698,7 +758,7 @@ _ping_rtt() {
     local ip="$1"
     [ -z "$ip" ] && return 1
     local out
-    out="$(ping -c1 -t2 "$ip" 2>/dev/null)"
+    out="$(_ping_host "$ip")"
     [ -z "$out" ] && return 1
     # Extract `time=X.Y ms` — value ranges 0.001 to 2000+. Round to int ms.
     echo "$out" | awk '
@@ -1013,7 +1073,11 @@ _do_mount() {
     fuse_backend="$(_detect_fuse_backend)"
     if [ "$fuse_backend" = "none" ]; then
         _log "mount: no FUSE backend found"
-        echo "error:no_fuse_backend:Install macFUSE (osxfuse.github.io) or FUSE-T (brew install fuse-t fuse-t-sshfs)"
+        if [ "$AF_OS" = "Darwin" ]; then
+            echo "error:no_fuse_backend:Install macFUSE (osxfuse.github.io) or FUSE-T (brew install fuse-t fuse-t-sshfs)"
+        else
+            echo "error:no_fuse_backend:Install sshfs (Arch: sudo pacman -S sshfs · Debian/Ubuntu: sudo apt install sshfs · Fedora: sudo dnf install fuse-sshfs)"
+        fi
         return 1
     fi
 
@@ -1799,8 +1863,8 @@ panic-unmount-all)
             mp="$(_mount_point "$name" "$dl")"
             [ -z "$mp" ] && continue
             _log "panic-unmount: $mp"
-            # diskutil can hang on dead mounts → wrap in timeout
-            perl -e 'alarm 3; exec @ARGV' diskutil unmount force "$mp" 2>/dev/null
+            # Force-unmount can hang on dead mounts → time-bounded
+            _force_unmount_t "$mp"
             umount -f "$mp" 2>/dev/null
             # Clean up empty dir
             base_mp="$(_json_raw mount_base)"
@@ -1810,10 +1874,10 @@ panic-unmount-all)
 
     # Step 3: catch any orphan mounts not in config (legacy paths like ~/mounts/*)
     base="$(_json_raw mount_base)"
-    mount | grep -E 'osxfuse|macfuse|fuse-t' | sed -n 's/^.* on \(.*\) (.*$/\1/p' | while read -r orphan; do
+    _list_fuse_mounts | while read -r orphan; do
         [ -z "$orphan" ] && continue
         _log "panic-unmount: orphan $orphan"
-        perl -e 'alarm 3; exec @ARGV' diskutil unmount force "$orphan" 2>/dev/null
+        _force_unmount_t "$orphan"
         umount -f "$orphan" 2>/dev/null
     done
 
@@ -1829,7 +1893,7 @@ panic-check)
             if mount | grep -qF " on $mp "; then
                 if ! _alive "$mp"; then
                     _log "panic-check: stale $mp — force unmounting"
-                    perl -e 'alarm 3; exec @ARGV' diskutil unmount force "$mp" 2>/dev/null
+                    _force_unmount_t "$mp"
                     umount -f "$mp" 2>/dev/null
                     # Verified per-PID SIGKILL — a broad `pkill -f "sshfs.*workstation"`
                     # pattern would also match unrelated AutoFuse mounts.

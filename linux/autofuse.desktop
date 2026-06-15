@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AutoFuse
+GenericName=Remote Disk Mounter
+Comment=Mount, heal and wake remote machines over SSHFS
+Exec=autofuse-gui
+Icon=drive-removable-media
+Terminal=false
+Categories=Utility;System;Network;FileTools;
+Keywords=sshfs;mount;ssh;remote;fuse;
+StartupNotify=true

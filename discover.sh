@@ -4,6 +4,15 @@
 # Commands: scan-network, scan-tailscale, import-ssh-config, probe-host, detect-vpn
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# OS portability: macOS uses route/ifconfig/arp/ipconfig; Linux uses iproute2.
+AF_OS="$(uname -s)"
+
+# Neighbour/ARP table, one entry per line. macOS: `arp -a`; Linux: `ip neigh`.
+_neighbour_table() {
+    if [ "$AF_OS" = "Darwin" ]; then arp -a 2>/dev/null
+    else ip neigh 2>/dev/null; fi
+}
+
 # Dedicated known_hosts for AutoFuse
 AF_KNOWN_HOSTS="$HOME/.config/autofuse/known_hosts"
 mkdir -p "$(dirname "$AF_KNOWN_HOSTS")" 2>/dev/null
@@ -34,52 +43,61 @@ _timeout() {
 # by the Add Workstation dialog and by MCP's `scan_network` tool.
 _scan_network() {
     # Get local subnet from primary interface
-    local iface subnet
-    iface="$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
-    [ -z "$iface" ] && iface="en0"
+    local iface local_ip
+    if [ "$AF_OS" = "Darwin" ]; then
+        iface="$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
+        [ -z "$iface" ] && iface="en0"
+        local_ip="$(ipconfig getifaddr "$iface" 2>/dev/null)"
+    else
+        iface="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+        [ -z "$iface" ] && iface="eth0"
+        local_ip="$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    fi
 
-    # Populate ARP cache with a quick broadcast ping (non-blocking)
-    local local_ip
-    local_ip="$(ipconfig getifaddr "$iface" 2>/dev/null)"
+    # Populate the neighbour cache with a quick broadcast ping (non-blocking)
     if [ -n "$local_ip" ]; then
         local prefix="${local_ip%.*}"
-        # Quick ping sweep to populate ARP cache — background, limited time
-        ping -c 1 -t 1 "${prefix}.255" >/dev/null 2>&1 &
+        if [ "$AF_OS" = "Darwin" ]; then
+            ping -c 1 -t 1 "${prefix}.255" >/dev/null 2>&1 &
+        else
+            ping -c 1 -W 1 -b "${prefix}.255" >/dev/null 2>&1 &
+        fi
         local ping_pid=$!
         sleep 1
         kill "$ping_pid" 2>/dev/null
     fi
 
-    # Parse ARP cache for known hosts
+    # Parse the neighbour/ARP cache for known hosts
     local tmpfile
     tmpfile="$(mktemp /tmp/wm_scan.XXXXXX)"
 
-    arp -a 2>/dev/null | while IFS= read -r line; do
-        # Format: ? (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
+    _neighbour_table | while IFS= read -r line; do
         local ip hostname mac
-        ip="$(echo "$line" | sed -n 's/.*(\([0-9.]*\)).*/\1/p')"
+        if [ "$AF_OS" = "Darwin" ]; then
+            # "? (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"
+            ip="$(echo "$line" | sed -n 's/.*(\([0-9.]*\)).*/\1/p')"
+            echo "$line" | grep -q "incomplete" && continue
+            mac="$(echo "$line" | awk '{print $4}')"
+            hostname="$(echo "$line" | awk '{print $1}')"
+            [ "$hostname" = "?" ] && hostname=""
+        else
+            # "ip neigh": "192.168.1.5 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+            ip="$(echo "$line" | awk '{print $1}')"
+            echo "$line" | grep -qE 'FAILED|INCOMPLETE' && continue
+            mac="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}')"
+            hostname=""
+        fi
         [ -z "$ip" ] && continue
 
-        # Skip incomplete entries
-        echo "$line" | grep -q "incomplete" && continue
-
-        # Filter out multicast (224.0.0.0/4) and broadcast (255.255.255.255)
-        # addresses that the ARP cache accumulates but aren't real hosts.
-        # Without this, scan_network returned rows like
-        # "224.0.0.251|mdns.mcast.net|1:0:5e:0:0:fb" which confused LLM callers.
+        # Filter multicast (224.0.0.0/4) and broadcast addresses.
         case "$ip" in
             22[4-9].*|23[0-9].*|255.255.255.255) continue ;;
         esac
 
-        mac="$(echo "$line" | awk '{print $4}')"
-        hostname="$(echo "$line" | awk '{print $1}')"
-        [ "$hostname" = "?" ] && hostname=""
-
-        # Also filter broadcast MAC (ff:ff:ff:ff:ff:ff) — ARP sometimes caches
-        # these for hosts that never replied, and they're never valid peers.
+        # Filter broadcast / multicast MACs.
         case "$mac" in
-            ff:ff:ff:ff:ff:ff|FF:FF:FF:FF:FF:FF) continue ;;
-            1:0:5e:*|01:00:5e:*) continue ;;  # IPv4 multicast MAC prefix
+            ""|ff:ff:ff:ff:ff:ff|FF:FF:FF:FF:FF:FF) continue ;;
+            1:0:5e:*|01:00:5e:*) continue ;;
         esac
 
         echo "${ip}|${hostname}|${mac}" >> "$tmpfile"
@@ -452,6 +470,24 @@ _probe_host() {
 #   - `wifiman` — Unifi WifiMan (named `utun-ts` or similar, discovered via DNS)
 # Empty output means no VPN active — treat as expected, not error.
 _detect_vpn() {
+    # Linux: simple, robust best-effort (tailscale + wireguard) using iproute2.
+    # The macOS utun-scan below is Darwin-specific and skipped here.
+    if [ "$AF_OS" != "Darwin" ]; then
+        if command -v tailscale >/dev/null 2>&1; then
+            local ts_ip
+            ts_ip="$(tailscale ip -4 2>/dev/null | head -1)"
+            [ -n "$ts_ip" ] && echo "tailscale0|${ts_ip}|tailscale|"
+        fi
+        if command -v wg >/dev/null 2>&1; then
+            local wiface wg_ip
+            for wiface in $(wg show interfaces 2>/dev/null); do
+                wg_ip="$(ip -o -4 addr show dev "$wiface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+                [ -n "$wg_ip" ] && echo "${wiface}|${wg_ip}|wireguard|"
+            done
+        fi
+        return 0
+    fi
+
     # Check Tailscale
     if command -v tailscale >/dev/null 2>&1; then
         local ts_ip

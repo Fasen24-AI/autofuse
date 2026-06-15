@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# AutoFuse — wofi/rofi quick picker (GUI "C").
+#
+# A keybind-friendly launcher for tiling WMs (Hyprland, sway, i3, …): pops up a
+# menu of your machines, you pick one and an action, and it runs the matching
+# `autofuse` command. No tray host needed. Bind it in hyprland.conf, e.g.:
+#   bind = $mod, M, exec, autofuse-wofi
+#
+# Uses wofi if present, else rofi. Requires `autofuse` on PATH + python3.
+set -euo pipefail
+
+command -v autofuse >/dev/null 2>&1 || { echo "autofuse not on PATH" >&2; exit 1; }
+
+# Pick the available dmenu-style launcher.
+_menu() {
+    local prompt="$1"
+    if command -v wofi >/dev/null 2>&1; then
+        wofi --dmenu --prompt "$prompt" --insensitive
+    elif command -v rofi >/dev/null 2>&1; then
+        rofi -dmenu -p "$prompt" -i
+    else
+        echo "Neither wofi nor rofi is installed." >&2
+        exit 1
+    fi
+}
+
+_notify() {
+    command -v notify-send >/dev/null 2>&1 && notify-send "AutoFuse" "$1" || true
+}
+
+# One line per machine: "name — ip — mounted/total [status]".
+menu_lines() {
+    autofuse json list 2>/dev/null | python3 - "$(autofuse json status 2>/dev/null || echo '[]')" <<'PY'
+import json, sys
+listing = json.load(sys.stdin)
+try:
+    status = json.loads(sys.argv[1])
+except Exception:
+    status = []
+by_ws = {}
+for r in status:
+    by_ws.setdefault(r.get("workstation"), []).append(r.get("status", ""))
+for m in listing:
+    name = m.get("name", "")
+    sts = by_ws.get(name, [])
+    total = len(m.get("disks", [])) or len(sts)
+    mounted = sum(1 for s in sts if s == "mounted")
+    if any(s == "stale" for s in sts):
+        tag = "stale"
+    elif total and mounted == total:
+        tag = "mounted"
+    elif mounted:
+        tag = "partial"
+    else:
+        tag = "unmounted"
+    ip = m.get("lan_ip") or m.get("vpn_ip") or ""
+    print(f"{name} — {ip} — {mounted}/{total} [{tag}]")
+PY
+}
+
+lines="$(menu_lines)"
+[ -z "$lines" ] && { _notify "No machines configured"; exit 0; }
+
+choice="$(printf '%s\n' "$lines" | _menu "AutoFuse — machine")"
+[ -z "$choice" ] && exit 0
+ws="${choice%% — *}"
+
+action="$(printf 'Connect\nMount all\nUnmount\nWake\nStatus\n' | _menu "$ws")"
+[ -z "$action" ] && exit 0
+
+case "$action" in
+    Connect)    _notify "Connecting $ws…"; autofuse connect "$ws"  >/dev/null 2>&1 && _notify "$ws connected"  || _notify "$ws: connect failed" ;;
+    "Mount all") _notify "Mounting $ws…";  autofuse mount "$ws"    >/dev/null 2>&1 && _notify "$ws mounted"    || _notify "$ws: mount failed" ;;
+    Unmount)    _notify "Unmounting $ws…"; autofuse unmount "$ws"  >/dev/null 2>&1 && _notify "$ws unmounted"  || _notify "$ws: unmount failed" ;;
+    Wake)       _notify "Waking $ws…";     autofuse wake "$ws"     >/dev/null 2>&1 && _notify "$ws woken"      || _notify "$ws: wake failed" ;;
+    Status)     autofuse json status >/dev/null 2>&1; _notify "$(autofuse status 2>/dev/null | sed -n '4,12p')" ;;
+esac
