@@ -727,9 +727,13 @@ _alive() {
     local mp="$1"
     ls "$mp" >/dev/null 2>&1 &
     local lspid=$!
-    # Watchdog: only acts if ls is STILL running at the deadline (kill -0 guard),
-    # so a merely slow-but-completed ls never triggers an sshfs kill.
-    ( sleep 2; kill -0 "$lspid" 2>/dev/null && _kill_sshfs_for "$mp"; kill -9 "$lspid" 2>/dev/null ) &
+    # Watchdog kills the backing sshfs ONLY if ls is still stuck after 8s — long
+    # enough that a slow-but-alive mount (e.g. `ls /` of a VPS over a WAN link)
+    # finishes first and is never killed, short enough to bound a real wedge.
+    # The kill-0 guard means a completed ls (reaped by the wait below) can't be
+    # mistaken for stuck. A healthy mount returns at ls-speed; the 8s only
+    # applies to a genuinely dead mount.
+    ( sleep 8; kill -0 "$lspid" 2>/dev/null && _kill_sshfs_for "$mp"; kill -9 "$lspid" 2>/dev/null ) &
     local wd=$!
     wait "$lspid" 2>/dev/null
     local rc=$?
